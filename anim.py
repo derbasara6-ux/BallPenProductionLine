@@ -44,6 +44,12 @@ PEN_Y  = 5.0
 SPEED  = 0.13           # x units per frame
 TOTAL_FRAMES = 260
 
+# Pre-computed once: the docking point at the Assembly station.
+# Used every frame by parts traveling diagonally toward it, so caching
+# it here avoids re-doing the same arithmetic on every tick.
+ASSEMBLY_TARGET_X = X_ASSEMBLY - 0.5
+ASSEMBLY_TARGET_Y = PEN_Y
+
 # ---------------------------------------------------------------------------
 # Figure setup - everything drawn here is static background.
 # ---------------------------------------------------------------------------
@@ -59,6 +65,8 @@ ax.text(7.75, 9.5, "Ball Pen Production Line",
 
 
 def draw_station(x, y, w, h, label, color):
+    """Drop a labeled rounded box on the canvas. Used only for the static
+    background — these never move or get redrawn."""
     box = FancyBboxPatch(
         (x - w / 2, y - h / 2), w, h,
         boxstyle="round,pad=0.04",
@@ -69,7 +77,8 @@ def draw_station(x, y, w, h, label, color):
             fontsize=8.5, weight="bold", zorder=3)
 
 
-# Component lanes
+# Component lanes — one row per component type, each with its own
+# Maker → QC → Bin chain plus the diagonal feeder line into Assembly.
 for ct in COMPONENT_TYPES:
     y = LANE_Y[ct]
     draw_station(X_MAKER, y, 1.3, 0.9, f"Make\n{ct}", "#fff3cd")
@@ -80,7 +89,7 @@ for ct in COMPONENT_TYPES:
     ax.plot([X_BIN + 0.5, X_ASSEMBLY - 0.9], [y, PEN_Y],
             color="#bbb", linewidth=1, zorder=1)
 
-# Downstream
+# Downstream — single shared row from Assembly through to the Shipped tray.
 draw_station(X_ASSEMBLY,   PEN_Y, 1.8, 5.0, "Assembly", "#ffe4e1")
 draw_station(X_FINAL_QC,   PEN_Y, 1.2, 0.9, "Final\nQC", "#cce5ff")
 draw_station(X_PACKAGING,  PEN_Y, 1.2, 0.9, "Pack",     "#d4edda")
@@ -93,7 +102,8 @@ ax.plot([X_FINAL_QC + 0.6, X_PACKAGING - 0.6], [PEN_Y, PEN_Y],
 ax.plot([X_PACKAGING + 0.6, X_SHIPPED - 0.75], [PEN_Y, PEN_Y],
         color="#bbb", linewidth=1, zorder=1)
 
-# Live text overlays
+# Live text overlays — these stay around the whole animation and just
+# get their text updated each frame.
 counter_text = ax.text(7.75, -0.55, "", ha="center", fontsize=11, weight="bold")
 bin_labels   = {ct: ax.text(X_BIN, LANE_Y[ct] - 0.6, "",
                             ha="center", fontsize=8, weight="bold")
@@ -118,29 +128,48 @@ shipped_dots: list  = []
 
 
 def step_components(to_remove):
-    """Move every component one tick along its path."""
+    """Walk every component one tick along whatever path it's on.
+
+    Each component carries a 'stage' string that says where it is in its
+    journey. We branch on that and either nudge it closer to its next
+    waypoint, or — if it's arrived — flag it for removal so the caller
+    can drop it from the items list.
+    """
     global arrivals_at_assembly
     for it in items:
         if it["kind"] != "component":
             continue
         stage = it["stage"]
+
         if stage == "to_qc":
+            # Rolling right toward the QC station. When it gets there,
+            # decide whether it survives inspection or falls off the belt.
             it["x"] += SPEED
             if it["x"] >= X_QC:
                 it["stage"] = "falling" if it["defective"] else "to_bin"
+
         elif stage == "to_bin":
+            # Past QC, heading into its bin. On arrival we just bump the
+            # bin counter and retire the moving circle.
             it["x"] += SPEED
             if it["x"] >= X_BIN:
                 bins[it["type"]] += 1
                 to_remove.append(it)
+
         elif stage == "falling":
+            # Defective part dropping off the belt — animated downward
+            # until it's clearly off-screen, then counted as a reject.
             it["y"] -= SPEED * 1.4
             if it["y"] < -0.5:
                 counters["rejected"] += 1
                 to_remove.append(it)
+
         elif stage == "to_assembly":
-            tx, ty = X_ASSEMBLY - 0.5, PEN_Y
-            dx, dy = tx - it["x"], ty - it["y"]
+            # Diagonal travel from a bin to the Assembly docking point.
+            # We compute a unit vector toward the target and step along it;
+            # once we're within one step's distance, count it as arrived.
+            dx = ASSEMBLY_TARGET_X - it["x"]
+            dy = ASSEMBLY_TARGET_Y - it["y"]
             dist = (dx * dx + dy * dy) ** 0.5
             if dist < SPEED:
                 arrivals_at_assembly += 1
@@ -151,7 +180,12 @@ def step_components(to_remove):
 
 
 def step_pens(to_remove):
-    """Advance assembled pens through final QC, packaging, and shipping."""
+    """Push assembled pens through the final stages: QC → Pack → Ship.
+
+    Pens always travel left-to-right along the centre line, so the logic
+    is much simpler than for components. The next_stage table says where
+    each stage hands off to and at what x-coordinate the handoff happens.
+    """
     next_stage = {
         "to_final_qc":  ("to_packaging", X_FINAL_QC),
         "to_packaging": ("to_shipped",   X_PACKAGING),
@@ -163,11 +197,16 @@ def step_pens(to_remove):
         stage = it["stage"]
         nxt, target = next_stage[stage]
         it["x"] += SPEED
+
         if it["x"] >= target:
+            # Reached the next station. Three possible outcomes:
             if stage == "to_final_qc" and it.get("defective"):
+                # Failed final QC — yank it off the line.
                 counters["rejected"] += 1
                 to_remove.append(it)
             elif nxt == "done":
+                # Made it all the way: park a permanent dot in the
+                # Shipped tray, laid out in a 4-column grid.
                 counters["shipped"] += 1
                 idx = counters["shipped"] - 1
                 col, row = idx % 4, idx // 4
@@ -179,11 +218,15 @@ def step_pens(to_remove):
                 shipped_dots.append(dot)
                 to_remove.append(it)
             else:
+                # Otherwise it's just moving on to the next stage.
                 it["stage"] = nxt
 
 
 def maybe_spawn_components():
-    """Each maker emits a part on its own random schedule."""
+    """Roll the dice for each maker. If its timer's up, emit a new part
+    (which might be defective) and reset the timer to a random delay.
+    The randomness keeps the four lanes from firing in sync, which would
+    look mechanical."""
     for ct in COMPONENT_TYPES:
         spawn_timers[ct] -= 1
         if spawn_timers[ct] <= 0:
@@ -198,7 +241,10 @@ def maybe_spawn_components():
 
 
 def maybe_dispatch_assembly(frame):
-    """If every bin has stock, send one of each toward Assembly."""
+    """Whenever every bin has at least one part queued and nothing's
+    currently in flight to Assembly, pull one of each from the bins and
+    send them on the diagonal. The frame % 12 check just paces the
+    dispatches so they don't all go off back-to-back."""
     in_flight = sum(1 for i in items
                     if i["kind"] == "component" and i["stage"] == "to_assembly")
     ready = all(bins[ct] >= 1 for ct in COMPONENT_TYPES)
@@ -214,7 +260,10 @@ def maybe_dispatch_assembly(frame):
 
 
 def maybe_emit_pen():
-    """When 4 components have docked at Assembly, spit out a pen."""
+    """Once four components have arrived at Assembly, consume them and
+    spawn a fresh pen heading toward Final QC. The 2% defect chance here
+    is the assembly process itself failing (separate from component
+    defects, which are caught earlier)."""
     global arrivals_at_assembly
     if arrivals_at_assembly >= 4:
         arrivals_at_assembly -= 4
@@ -227,7 +276,9 @@ def maybe_emit_pen():
 
 
 def render_dynamic():
-    """Draw circles for everything currently in motion + bin stacks."""
+    """Draw a fresh circle for every moving thing and every part stacked
+    in a bin. These all get wiped at the start of the next frame — only
+    the static background and the shipped tray persist between frames."""
     for it in items:
         radius = 0.22 if it["kind"] == "pen" else 0.17
         c = Circle((it["x"], it["y"]), radius,
@@ -236,6 +287,8 @@ def render_dynamic():
         ax.add_patch(c)
         frame_artists.append(c)
 
+    # Show bin contents as small stacked dots, capped at 4 visible per bin
+    # (the actual bin counter can go higher; this is just a visual hint).
     for ct in COMPONENT_TYPES:
         for i in range(min(bins[ct], 4)):
             cx = X_BIN - 0.25 + (i % 2) * 0.25
@@ -248,23 +301,36 @@ def render_dynamic():
 
 
 def update(frame):
-    """One animation tick."""
+    """One animation tick — called by FuncAnimation TOTAL_FRAMES times.
+
+    The order matters: spawn first so new parts can move this frame,
+    then step everything, then prune what's done, then dispatch any
+    new assembly batch, then check for finished pens, then redraw.
+    """
+    # Wipe last frame's transient circles. Only the moving items and
+    # bin-stack dots are cleared; static background and shipped pens stay.
     for a in frame_artists:
         a.remove()
     frame_artists.clear()
 
     maybe_spawn_components()
+
     to_remove: list = []
     step_components(to_remove)
     step_pens(to_remove)
-    for it in to_remove:
-        if it in items:
-            items.remove(it)
+
+    # Drop everything that finished its journey this frame.
+    # Using a set of object ids to filter is O(n) total, vs the previous
+    # O(n²) approach that did `items.remove(it)` for each retiree.
+    if to_remove:
+        retired_ids = {id(it) for it in to_remove}
+        items[:] = [it for it in items if id(it) not in retired_ids]
 
     maybe_dispatch_assembly(frame)
     maybe_emit_pen()
     render_dynamic()
 
+    # Refresh the bottom counter line.
     m = counters["made"]
     counter_text.set_text(
         f"Made:  barrels {m['barrel']}   tips {m['tip']}   "

@@ -27,14 +27,19 @@ from typing import Deque, List, Optional
 # ---------------------------------------------------------------------------
 
 class Quality(Enum):
-    """Quality grade assigned by inspection stations."""
+    """Every part and every finished pen ends up tagged either OK or
+    DEFECTIVE. Using an Enum here instead of strings or booleans means
+    a typo like 'defective' vs 'Defective' would fail at import time
+    rather than silently letting bad parts slip through."""
     OK = auto()
     DEFECTIVE = auto()
 
 
 @dataclass
 class Component:
-    """A generic part that goes into a pen (barrel, tip, cartridge, cap)."""
+    """A single part — could be a barrel, a tip, a cartridge, or a cap.
+    The serial number lets us trace individual parts through the line in
+    the log output, which is handy for debugging weird behavior."""
     name: str
     serial: int
     quality: Quality = Quality.OK
@@ -42,7 +47,10 @@ class Component:
 
 @dataclass
 class BallPen:
-    """Finished or in-progress pen: a composition of components."""
+    """A pen, finished or in-progress. Built up by Assembly attaching
+    each of the four required components, then stamped with its own
+    overall quality grade (assembly itself can fail even if every part
+    was good). The packaged flag flips to True once Packaging touches it."""
     serial: int
     barrel: Optional[Component] = None
     tip: Optional[Component] = None
@@ -52,7 +60,9 @@ class BallPen:
     packaged: bool = False
 
     def is_complete(self) -> bool:
-        """Has every component been installed?"""
+        """True only if all four component slots have been filled in.
+        Used by Final QC to catch any pen that somehow got here missing
+        a part — shouldn't happen in normal flow, but it's cheap insurance."""
         return all([self.barrel, self.tip, self.cartridge, self.cap])
 
 
@@ -61,11 +71,12 @@ class BallPen:
 # ---------------------------------------------------------------------------
 
 class Station(ABC):
-    """Abstract base for any station on the line.
+    """The shared shape every station on the line follows.
 
-    Every concrete station must implement `process`, which takes one item
-    from its input and returns the (possibly transformed) item, or None
-    if the item should be discarded (e.g., failed QC).
+    Each station has a name (for logging), a defect rate (probability
+    that whatever it produces comes out flawed), and a pair of running
+    counters. The only thing subclasses must define is `process` —
+    everything else is provided here so individual stations stay tiny.
     """
 
     def __init__(self, name: str, defect_rate: float = 0.0):
@@ -79,7 +90,10 @@ class Station(ABC):
         ...
 
     def _maybe_defect(self) -> Quality:
-        """Helper: simulate manufacturing variance."""
+        """Roll the dice once. Returns DEFECTIVE with probability equal
+        to this station's defect_rate, otherwise OK. Centralising this
+        keeps the randomness in one place so every station behaves
+        consistently."""
         return (
             Quality.DEFECTIVE
             if random.random() < self.defect_rate
@@ -91,7 +105,10 @@ class Station(ABC):
 
 
 class ComponentMaker(Station):
-    """Manufactures one type of component (barrels, tips, ...)."""
+    """Manufactures one specific kind of component. There are four of
+    these on the line (one per component name) running in parallel.
+    Each maker keeps its own serial counter so barrels and tips have
+    independent numbering."""
 
     def __init__(self, component_name: str, defect_rate: float = 0.05):
         super().__init__(name=f"Make {component_name}", defect_rate=defect_rate)
@@ -99,6 +116,9 @@ class ComponentMaker(Station):
         self._counter = 0
 
     def process(self, _ignored=None) -> Component:
+        # The argument is ignored — makers don't have an input, they just
+        # produce parts on demand. We accept _ignored only to satisfy the
+        # Station interface contract.
         self._counter += 1
         self.processed += 1
         part = Component(
@@ -111,7 +131,10 @@ class ComponentMaker(Station):
 
 
 class QualityControl(Station):
-    """Discards defective components before they reach assembly."""
+    """The first inspection step. Accepts a freshly-made component and
+    either passes it through (returning it unchanged) or rejects it
+    (returning None). The line treats None as 'this never happened' —
+    rejected parts simply don't make it to the bins."""
 
     def process(self, item: Component) -> Optional[Component]:
         self.processed += 1
@@ -124,7 +147,10 @@ class QualityControl(Station):
 
 
 class AssemblyStation(Station):
-    """Combines four good components into a single pen."""
+    """Takes one of each component type and snaps them together into a
+    pen. There's a small chance (defect_rate) that assembly itself goes
+    wrong even when every input part was perfect — that's caught later
+    by Final QC."""
 
     def __init__(self, defect_rate: float = 0.02):
         super().__init__(name="Assembly", defect_rate=defect_rate)
@@ -146,7 +172,9 @@ class AssemblyStation(Station):
 
 
 class FinalInspection(Station):
-    """Final QC: a pen must be complete *and* non-defective."""
+    """The last gate before packaging. A pen has to clear two checks: it
+    must have all four components installed, and its overall quality flag
+    must be OK. Anything that fails either check gets dropped."""
 
     def process(self, pen: BallPen) -> Optional[BallPen]:
         self.processed += 1
@@ -159,7 +187,9 @@ class FinalInspection(Station):
 
 
 class Packaging(Station):
-    """Wraps the pen — the last step before shipping."""
+    """The finishing touch. No defect rate here — packaging is assumed
+    to never fail. Just flips the pen's `packaged` flag to True and
+    sends it on its way."""
 
     def __init__(self):
         super().__init__(name="Packaging")
@@ -176,15 +206,22 @@ class Packaging(Station):
 # ---------------------------------------------------------------------------
 
 class ProductionLine:
-    """Runs the whole line for a target number of pens."""
+    """The whole factory wired up as one object. Holds every station,
+    every bin, and the list of finished pens. Calling .run(target)
+    drives the line until that many shippable pens have come off it."""
 
     COMPONENT_NAMES = ("barrel", "tip", "cartridge", "cap")
 
     def __init__(self):
-        # One maker + one QC per component
+        # One maker and one QC station per component type. Using dicts
+        # keyed by component name makes it easy to fetch the right pair
+        # in the loops below.
         self.makers = {n: ComponentMaker(n) for n in self.COMPONENT_NAMES}
         self.qcs = {n: QualityControl(name=f"QC {n}") for n in self.COMPONENT_NAMES}
-        # Queues hold *good* components waiting for assembly
+        # Bins are FIFO queues of inspected, known-good components waiting
+        # to be pulled into Assembly. A deque is used because it gives O(1)
+        # append-on-the-right and popleft-from-the-left, matching how a
+        # real conveyor belt feeds parts in the order they were made.
         self.bins: dict[str, Deque[Component]] = {
             n: deque() for n in self.COMPONENT_NAMES
         }
@@ -196,7 +233,11 @@ class ProductionLine:
     # -- internal helpers ----------------------------------------------------
 
     def _refill_bins(self) -> None:
-        """Make + inspect components until each bin has at least one."""
+        """Make sure every bin has at least one part queued up before we
+        try to assemble. For each empty bin, we keep producing and
+        inspecting parts until one survives QC. This is what causes
+        defective components to inflate the 'made' count well above the
+        number of pens that eventually ship."""
         for name in self.COMPONENT_NAMES:
             while not self.bins[name]:
                 raw = self.makers[name].process()
@@ -205,6 +246,11 @@ class ProductionLine:
                     self.bins[name].append(inspected)
 
     def _assemble_one(self) -> Optional[BallPen]:
+        """One full attempt at making a pen: pull one of each component
+        from the bins, hand them to Assembly, run the result through
+        Final QC, and if it survives, package it. Returns None if the
+        pen failed Final QC — the caller is responsible for noticing
+        and trying again."""
         parts = {n: self.bins[n].popleft() for n in self.COMPONENT_NAMES}
         pen = self.assembly.process(parts)
         pen = self.final_qc.process(pen)
@@ -215,7 +261,10 @@ class ProductionLine:
     # -- public API ----------------------------------------------------------
 
     def run(self, target: int) -> None:
-        """Produce `target` shippable pens."""
+        """Keep running the line until `target` pens have shipped.
+        Each iteration: top up the bins, try to assemble one pen, and
+        if it survived, add it to the shipped list. Failed assemblies
+        just go around again."""
         print(f"\n=== Starting production: target = {target} pens ===\n")
         while len(self.shipped) < target:
             self._refill_bins()
@@ -225,6 +274,10 @@ class ProductionLine:
         self._report()
 
     def _report(self) -> None:
+        """Dump per-station stats once the run is done. Useful for
+        sanity-checking that defect rates are roughly what you set
+        and for spotting any station that's processing way more or
+        fewer items than expected."""
         print("\n=== Production report ===")
         all_stations: list[Station] = [
             *self.makers.values(),
